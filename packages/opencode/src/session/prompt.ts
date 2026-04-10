@@ -253,6 +253,29 @@ export namespace SessionPrompt {
     return s[sessionID].abort.signal
   }
 
+  function activeUserID(msgs: MessageV2.WithParts[]) {
+    let latestAssistant: MessageV2.Assistant | undefined
+    const started = new Set<string>()
+
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const info = msgs[i].info
+      if (info.role !== "assistant") continue
+      const assistant = info as MessageV2.Assistant
+      if (!latestAssistant) latestAssistant = assistant
+      started.add(assistant.parentID)
+    }
+
+    if (latestAssistant && (!latestAssistant.finish || ["tool-calls", "unknown"].includes(latestAssistant.finish))) {
+      return latestAssistant.parentID
+    }
+
+    for (const msg of msgs) {
+      if (msg.info.role === "user" && !started.has(msg.info.id)) {
+        return msg.info.id
+      }
+    }
+  }
+
   export function cancel(sessionID: string) {
     log.info("cancel", { sessionID })
     const s = state()
@@ -282,7 +305,18 @@ export namespace SessionPrompt {
       })
     }
 
-    using _ = defer(() => cancel(sessionID))
+    let resumeQueued = false
+    using _ = defer(() => {
+      if (resumeQueued) {
+        loop({ sessionID, resume_existing: true }).catch((error) => {
+          log.error("session loop failed to resume queued prompt", { sessionID, error })
+          cancel(sessionID)
+        })
+        return
+      }
+
+      cancel(sessionID)
+    })
 
     // Structured output state
     // Note: On session resumption, state is reset but outputFormat is preserved
@@ -296,6 +330,11 @@ export namespace SessionPrompt {
       log.info("loop", { step, sessionID })
       if (abort.aborted) break
       let msgs = await MessageV2.filterCompacted(MessageV2.stream(sessionID))
+      const currentUserID = activeUserID(msgs)
+      if (!currentUserID) {
+        log.info("exiting loop", { sessionID })
+        break
+      }
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
@@ -303,26 +342,21 @@ export namespace SessionPrompt {
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
-        if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
-        if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info as MessageV2.Assistant
-        if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
-          lastFinished = msg.info as MessageV2.Assistant
+        if (!lastUser && msg.info.role === "user" && msg.info.id === currentUserID) {
+          lastUser = msg.info as MessageV2.User
+        }
+        if (msg.info.role === "assistant" && msg.info.parentID === currentUserID) {
+          if (!lastAssistant) lastAssistant = msg.info as MessageV2.Assistant
+          if (!lastFinished && msg.info.finish) lastFinished = msg.info as MessageV2.Assistant
+        }
         if (lastUser && lastFinished) break
         const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
-        if (task && !lastFinished) {
+        if (msg.info.role === "assistant" && msg.info.parentID === currentUserID && task.length > 0 && !lastFinished) {
           tasks.push(...task)
         }
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-      if (
-        lastAssistant?.finish &&
-        !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-        lastUser.id < lastAssistant.id
-      ) {
-        log.info("exiting loop", { sessionID })
-        break
-      }
 
       step++
       if (step === 1)
@@ -715,9 +749,10 @@ export namespace SessionPrompt {
     for await (const item of MessageV2.stream(sessionID)) {
       if (item.info.role === "user") continue
       const queued = state()[sessionID]?.callbacks ?? []
-      for (const q of queued) {
-        q.resolve(item)
+      if (resume_existing) {
+        queued.shift()?.resolve(item)
       }
+      resumeQueued = queued.length > 0
       return item
     }
     throw new Error("Impossible")
