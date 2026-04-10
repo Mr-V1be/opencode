@@ -1299,6 +1299,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           throw new Error("Impossible")
         })
 
+      // Find the first unhandled user message (FIFO order).
+      // A user message is "handled" if an assistant message with that parentID exists.
+      function activeUserID(msgs: MessageV2.WithParts[]): string | undefined {
+        let latestAssistant: MessageV2.Assistant | undefined
+        const started = new Set<string>()
+
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const info = msgs[i].info
+          if (info.role !== "assistant") continue
+          const assistant = info as MessageV2.Assistant
+          if (!latestAssistant) latestAssistant = assistant
+          started.add(assistant.parentID)
+        }
+
+        // If the latest assistant turn is still in progress, keep processing it
+        if (latestAssistant && (!latestAssistant.finish || ["tool-calls", "unknown"].includes(latestAssistant.finish))) {
+          return latestAssistant.parentID
+        }
+
+        // Otherwise find the first user message that has no assistant reply yet
+        for (const msg of msgs) {
+          if (msg.info.role === "user" && !started.has(msg.info.id)) {
+            return msg.info.id
+          }
+        }
+      }
+
       const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
         function* (sessionID: SessionID) {
           const ctx = yield* InstanceState.context
@@ -1312,18 +1339,30 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
+            const currentUserID = activeUserID(msgs)
+            if (!currentUserID) {
+              log.info("exiting loop, no unhandled user messages", { sessionID })
+              break
+            }
+
             let lastUser: MessageV2.User | undefined
             let lastAssistant: MessageV2.Assistant | undefined
             let lastFinished: MessageV2.Assistant | undefined
             let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
             for (let i = msgs.length - 1; i >= 0; i--) {
               const msg = msgs[i]
-              if (!lastUser && msg.info.role === "user") lastUser = msg.info
-              if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info
-              if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) lastFinished = msg.info
+              if (!lastUser && msg.info.role === "user" && msg.info.id === currentUserID) {
+                lastUser = msg.info
+              }
+              if (msg.info.role === "assistant" && msg.info.parentID === currentUserID) {
+                if (!lastAssistant) lastAssistant = msg.info
+                if (!lastFinished && msg.info.finish) lastFinished = msg.info
+              }
               if (lastUser && lastFinished) break
               const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
-              if (task && !lastFinished) tasks.push(...task)
+              if (msg.info.role === "assistant" && msg.info.parentID === currentUserID && task.length > 0 && !lastFinished) {
+                tasks.push(...task)
+              }
             }
 
             if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
@@ -1341,11 +1380,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             if (
               lastAssistant?.finish &&
               !["tool-calls"].includes(lastAssistant.finish) &&
-              !hasToolCalls &&
-              lastUser.id < lastAssistant.id
+              !hasToolCalls
             ) {
-              log.info("exiting loop", { sessionID })
-              break
+              // This user's turn is complete. Check if there are more queued.
+              log.info("turn complete, checking for queued prompts", { sessionID, currentUserID })
+              continue
             }
 
             step++
