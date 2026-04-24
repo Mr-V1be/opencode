@@ -497,6 +497,87 @@ it.live("loop continues when finish is stop but assistant has tool parts", () =>
   ),
 )
 
+it.live("loop stops after compaction overflow instead of retrying the same turn", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const original = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+
+      yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
+      yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
+
+      const settled = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout("2 seconds"))
+
+      if (!settled) {
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        throw new Error(
+          JSON.stringify(
+            {
+              calls: yield* llm.calls,
+              pending: yield* llm.pending,
+              messages: msgs.map((item) => ({
+                role: item.info.role,
+                id: item.info.id,
+                parentID: item.info.role === "assistant" ? item.info.parentID : undefined,
+                agent: item.info.agent,
+                finish: item.info.role === "assistant" ? item.info.finish : undefined,
+                error: item.info.role === "assistant" ? item.info.error?.name : undefined,
+                parts: item.parts.map((part) => part.type),
+              })),
+            },
+            null,
+            2,
+          ),
+        )
+      }
+
+      expect(Boolean(settled)).toBe(true)
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const compactionUsers = msgs.filter(
+        (item) => item.info.role === "user" && item.parts.some((part) => part.type === "compaction"),
+      )
+      const compactionAssistants = msgs.filter(
+        (item) =>
+          item.info.role === "assistant" &&
+          compactionUsers.some((user) => user.info.id === (item.info as MessageV2.Assistant).parentID),
+      )
+      const originalAssistants = msgs.filter(
+        (item) =>
+          item.info.role === "assistant" && (item.info as MessageV2.Assistant).parentID === original.info.id,
+      )
+      const originalOverflow = originalAssistants.find(
+        (item) => (item.info as MessageV2.Assistant).error?.name === "ContextOverflowError",
+      )
+
+      expect(compactionUsers).toHaveLength(1)
+      expect(compactionAssistants).toHaveLength(1)
+      expect(originalAssistants).toHaveLength(1)
+      expect((originalOverflow?.info as MessageV2.Assistant | undefined)?.error?.name).toBe("ContextOverflowError")
+    }),
+    {
+      git: true,
+      config: (url) => ({
+        ...providerCfg(url),
+        agent: {
+          title: { disable: true },
+          summary: { disable: true },
+        },
+      }),
+    },
+  ),
+)
+
 it.live("failed subtask preserves metadata on error tool state", () =>
   provideTmpdirServer(
     Effect.fnUntraced(function* ({ llm }) {

@@ -101,8 +101,12 @@ export namespace SessionPrompt {
       const state = yield* SessionRunState.Service
       const revert = yield* SessionRevert.Service
 
+      // Track explicitly cancelled sessions so loop() retry doesn't restart after Esc
+      const cancelledSessions = new Set<SessionID>()
+
       const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
         log.info("cancel", { sessionID })
+        cancelledSessions.add(sessionID)
         yield* state.cancel(sessionID)
       })
 
@@ -931,7 +935,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
         const info: MessageV2.User = {
-          id: input.messageID ?? MessageID.ascending(),
+          // Always generate a fresh ID at insertion time (not the TUI-provided one).
+          // The TUI creates messageID at keypress time, which would place the message
+          // at the wrong chronological position when queue-delayed.
+          id: MessageID.ascending(),
           role: "user",
           sessionID: input.sessionID,
           time: { created: Date.now() },
@@ -1269,9 +1276,40 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
         function* (input: PromptInput) {
+          // Serialization is handled at JS level (_promptQueues in the static
+          // prompt() function). By the time this Effect runs, it's guaranteed
+          // to be the only active prompt for this session.
+          cancelledSessions.delete(input.sessionID)
+
+          // Dequeue this message from the JS-level preview queue
+          const previews = _queuePreviews.get(input.sessionID) ?? []
+          previews.shift()
+          if (previews.length === 0) _queuePreviews.delete(input.sessionID)
+          else _queuePreviews.set(input.sessionID, previews)
+          if (previews.length > 0) {
+            yield* status.set(input.sessionID, { type: "busy", queued: previews.length, queuedPreview: [...previews] })
+          }
+
+          // Wait for agent to fully finish before creating this message
+          yield* state.waitForIdle(input.sessionID)
+
+          if (cancelledSessions.has(input.sessionID)) {
+            log.info("queue.prompt: cancelled while waiting", { sessionID: input.sessionID })
+            return yield* Effect.promise(async () => {
+              for await (const item of MessageV2.stream(input.sessionID)) return item
+              throw new Error("No messages found")
+            })
+          }
+
+          // Agent idle → create message and process it
+          log.info("queue.prompt: creating user message", { sessionID: input.sessionID })
           const session = yield* sessions.get(input.sessionID)
           yield* revert.cleanup(session)
           const message = yield* createUserMessage(input)
+          log.info("queue.prompt: user message created, starting loop", {
+            sessionID: input.sessionID,
+            messageID: message.info.id,
+          })
           yield* sessions.touch(input.sessionID)
 
           const permissions: Permission.Ruleset = []
@@ -1304,38 +1342,99 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       function activeUserID(msgs: MessageV2.WithParts[]): string | undefined {
         let latestAssistant: MessageV2.Assistant | undefined
         const started = new Set<string>()
+        const userMsgIDs: string[] = []
 
         for (let i = msgs.length - 1; i >= 0; i--) {
           const info = msgs[i].info
+          if (info.role === "user") userMsgIDs.push(info.id)
           if (info.role !== "assistant") continue
           const assistant = info as MessageV2.Assistant
           if (!latestAssistant) latestAssistant = assistant
           started.add(assistant.parentID)
         }
 
+        const unhandled = userMsgIDs.filter((id) => !started.has(id))
+        log.info("queue.activeUserID", {
+          totalMsgs: msgs.length,
+          userMsgs: userMsgIDs.length,
+          assistantReplies: started.size,
+          unhandledCount: unhandled.length,
+          latestAssistantFinish: latestAssistant?.finish ?? "none",
+          latestAssistantParent: latestAssistant?.parentID ?? "none",
+        })
+
         // If the latest assistant turn is still in progress, keep processing it
-        if (latestAssistant && (!latestAssistant.finish || ["tool-calls", "unknown"].includes(latestAssistant.finish))) {
+        if (
+          latestAssistant &&
+          !latestAssistant.error &&
+          (!latestAssistant.finish || ["tool-calls", "unknown"].includes(latestAssistant.finish))
+        ) {
+          log.info("queue.activeUserID: continuing in-progress turn", { parentID: latestAssistant.parentID })
           return latestAssistant.parentID
         }
 
         // Otherwise find the first user message that has no assistant reply yet
         for (const msg of msgs) {
           if (msg.info.role === "user" && !started.has(msg.info.id)) {
+            log.info("queue.activeUserID: found unhandled user message", {
+              id: msg.info.id,
+              unhandledTotal: unhandled.length,
+            })
             return msg.info.id
           }
         }
+        log.info("queue.activeUserID: no unhandled messages found")
       }
 
       const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
         function* (sessionID: SessionID) {
+          log.info("queue.runLoop: STARTED", { sessionID })
           const ctx = yield* InstanceState.context
           let structured: unknown | undefined
           let step = 0
+          let previousUserID: string | undefined
           const session = yield* sessions.get(sessionID)
 
+          // Finalize any stale in-progress assistants from crashed/interrupted
+          // previous runs. A new runLoop means previous fibers are dead, so any
+          // assistant with NO finish state is orphaned — mark it as error so
+          // activeUserID doesn't keep trying to "continue" it.
+          // NOTE: We only finalize `!finish` (undefined). We do NOT touch
+          // "tool-calls" (legit tool cycle) or "unknown" (possibly recoverable).
+          try {
+            const initialMsgs = yield* MessageV2.filterCompactedEffect(sessionID)
+            for (const m of initialMsgs) {
+              if (m.info.role !== "assistant") continue
+              const a = m.info as MessageV2.Assistant
+              if (!a.finish) {
+                a.finish = "error"
+                if (!a.error) {
+                  a.error = new NamedError.Unknown({
+                    message: "Run was interrupted before completion",
+                  }).toObject()
+                }
+                yield* sessions.updateMessage(a)
+                log.info("queue.runLoop: finalized stale assistant", {
+                  sessionID,
+                  assistantID: a.id,
+                  parentID: a.parentID,
+                })
+              }
+            }
+          } catch (e) {
+            log.info("queue.runLoop: stale cleanup failed", { sessionID, error: String(e) })
+          }
+
           while (true) {
-            yield* status.set(sessionID, { type: "busy" })
-            log.info("loop", { step, sessionID })
+            // Preserve queued count when setting busy status
+            const qPreviews = _queuePreviews.get(sessionID)
+            yield* status.set(
+              sessionID,
+              qPreviews && qPreviews.length > 0
+                ? { type: "busy", queued: qPreviews.length, queuedPreview: [...qPreviews] }
+                : { type: "busy" },
+            )
+            log.info("queue.runLoop: iteration", { step, sessionID, previousUserID })
 
             let msgs = yield* MessageV2.filterCompactedEffect(sessionID)
 
@@ -1345,6 +1444,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               break
             }
 
+            // Reset step counter when switching to a new queued user message
+            if (previousUserID !== undefined && previousUserID !== currentUserID) {
+              log.info("queue: switching to next message", { sessionID, from: previousUserID, to: currentUserID })
+              step = 0
+              structured = undefined
+            }
+            previousUserID = currentUserID
+
+            let lastUserMsg: MessageV2.WithParts | undefined
             let lastUser: MessageV2.User | undefined
             let lastAssistant: MessageV2.Assistant | undefined
             let lastFinished: MessageV2.Assistant | undefined
@@ -1352,6 +1460,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             for (let i = msgs.length - 1; i >= 0; i--) {
               const msg = msgs[i]
               if (!lastUser && msg.info.role === "user" && msg.info.id === currentUserID) {
+                lastUserMsg = msg
                 lastUser = msg.info
               }
               if (msg.info.role === "assistant" && msg.info.parentID === currentUserID) {
@@ -1359,13 +1468,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 if (!lastFinished && msg.info.finish) lastFinished = msg.info
               }
               if (lastUser && lastFinished) break
-              const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
-              if (msg.info.role === "assistant" && msg.info.parentID === currentUserID && task.length > 0 && !lastFinished) {
-                tasks.push(...task)
-              }
             }
 
             if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+            if (lastUserMsg && !lastFinished) {
+              tasks = lastUserMsg.parts.filter(
+                (part): part is MessageV2.CompactionPart | MessageV2.SubtaskPart =>
+                  part.type === "compaction" || part.type === "subtask",
+              )
+            }
 
             const lastAssistantMsg = msgs.findLast(
               (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1377,11 +1488,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const hasToolCalls =
               lastAssistantMsg?.parts.some((part) => part.type === "tool" && !part.metadata?.providerExecuted) ?? false
 
-            if (
-              lastAssistant?.finish &&
-              !["tool-calls"].includes(lastAssistant.finish) &&
-              !hasToolCalls
-            ) {
+            if (lastAssistant?.finish && !["tool-calls"].includes(lastAssistant.finish) && !hasToolCalls) {
               // This user's turn is complete. Check if there are more queued.
               log.info("turn complete, checking for queued prompts", { sessionID, currentUserID })
               continue
@@ -1412,7 +1519,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 auto: task.auto,
                 overflow: task.overflow,
               })
-              if (result === "stop") break
+              if (result === "stop") continue
               continue
             }
 
@@ -1485,11 +1592,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (step === 1) SessionSummary.summarize({ sessionID, messageID: lastUser.id })
 
               if (step > 1 && lastFinished) {
+                let injectedCount = 0
+                let skippedQueuedCount = 0
                 for (const m of msgs) {
                   if (m.info.role !== "user" || m.info.id <= lastFinished.id) continue
+                  // Don't leak queued messages into current turn's context.
+                  // Only inject messages that are part of the current user's turn.
+                  if (m.info.id !== currentUserID) {
+                    skippedQueuedCount++
+                    continue
+                  }
                   for (const p of m.parts) {
                     if (p.type !== "text" || p.ignored || p.synthetic) continue
                     if (!p.text.trim()) continue
+                    injectedCount++
                     p.text = [
                       "<system-reminder>",
                       "The user sent the following message:",
@@ -1499,6 +1615,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       "</system-reminder>",
                     ].join("\n")
                   }
+                }
+                if (skippedQueuedCount > 0) {
+                  log.info("queue: skipped injecting queued messages as system-reminders", {
+                    sessionID,
+                    currentUserID,
+                    skippedQueuedCount,
+                    injectedCount,
+                  })
                 }
               }
 
@@ -1557,10 +1681,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
               return "continue" as const
             }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
-            if (outcome === "break") break
+            if (outcome === "break") {
+              log.info("turn outcome=break, checking queue for next message", { sessionID, currentUserID })
+              continue
+            }
             continue
           }
 
+          log.info("queue.runLoop: EXITED while loop", { sessionID, lastStep: step, lastUserID: previousUserID })
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
           return yield* lastAssistant(sessionID)
         },
@@ -1569,7 +1697,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
         "SessionPrompt.loop",
       )(function* (input: z.infer<typeof LoopInput>) {
-        return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+        log.info("queue.loop: entering", { sessionID: input.sessionID })
+        const result = yield* state.ensureRunning(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          runLoop(input.sessionID),
+        )
+
+        // Don't retry if user explicitly cancelled (Esc)
+        if (cancelledSessions.has(input.sessionID)) {
+          log.info("queue.loop: session was cancelled by user, NOT retrying", { sessionID: input.sessionID })
+          return result
+        }
+
+        // After the current run finishes, check if there are still unprocessed
+        // messages (timing race: message may have been written to DB after
+        // runLoop's last activeUserID check).
+        const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID)
+        const pending = activeUserID(msgs)
+        if (pending) {
+          log.info("queue.loop: run finished but found pending message, re-entering", {
+            sessionID: input.sessionID,
+            pendingUserID: pending,
+          })
+          return yield* loop(input)
+        }
+        log.info("queue.loop: run finished, no pending messages", { sessionID: input.sessionID })
+        return result
       })
 
       const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
@@ -1798,8 +1952,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
   })
   export type PromptInput = z.infer<typeof PromptInput>
 
+  // Per-session JS-level queue: serializes prompt() calls BEFORE the Effect
+  // runtime. This guarantees FIFO order based on CALL order (not fiber order).
+  const _promptQueues = new Map<string, Promise<any>>()
+  const _queuePreviews = new Map<string, string[]>()
+
   export async function prompt(input: PromptInput) {
-    return runPromise((svc) => svc.prompt(PromptInput.parse(input)))
+    const parsed = PromptInput.parse(input)
+    const sid = parsed.sessionID
+
+    // Extract preview text for queue display
+    const textPart = parsed.parts?.find((p: any) => p.type === "text" && !p.synthetic)
+    const raw = (textPart as any)?.text ?? ""
+    const preview = raw.length > 50 ? raw.slice(0, 47) + "..." : raw
+
+    // Add to queue previews (sync — before any async work)
+    const previews = _queuePreviews.get(sid) ?? []
+    previews.push(preview)
+    _queuePreviews.set(sid, previews)
+
+    // Update status bar with queue info
+    if (previews.length > 0) {
+      SessionStatus.set(sid as any, { type: "busy", queued: previews.length, queuedPreview: [...previews] }).catch(
+        () => {},
+      )
+    }
+
+    // Capture previous promise synchronously (JS single-thread = atomic)
+    const prev = _promptQueues.get(sid) ?? Promise.resolve()
+
+    // Create a chained promise that waits for prev, then runs this prompt
+    let resolve!: () => void
+    const done = new Promise<void>((r) => {
+      resolve = r
+    })
+    const work = prev.then(
+      () => runPromise((svc) => svc.prompt(parsed)).finally(() => resolve()),
+      () => runPromise((svc) => svc.prompt(parsed)).finally(() => resolve()),
+    )
+
+    // Update queue synchronously — next caller will chain after us
+    _promptQueues.set(sid, done)
+
+    return work
   }
 
   export async function resolvePromptParts(template: string) {

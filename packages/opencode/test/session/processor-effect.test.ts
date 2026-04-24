@@ -625,7 +625,7 @@ it.live("session.processor effect tests compact on structured context overflow",
 
         expect(value).toBe("compact")
         expect(yield* llm.calls).toBe(1)
-        expect(handle.message.error).toBeUndefined()
+        expect(handle.message.error?.name).toBe("ContextOverflowError")
       }),
     { git: true, config: (url) => providerCfg(url) },
   ),

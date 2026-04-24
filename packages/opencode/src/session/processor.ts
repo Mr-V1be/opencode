@@ -518,6 +518,7 @@ export namespace SessionProcessor {
           const error = parse(e)
           if (MessageV2.ContextOverflowError.isInstance(error)) {
             ctx.needsCompaction = true
+            ctx.assistantMessage.error = error
             yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
             return
           }

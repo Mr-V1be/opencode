@@ -276,7 +276,7 @@ export const ProvidersLoginCommand = cmd({
       async fn() {
         UI.empty()
         prompts.intro("Add credential")
-        if (args.url) {
+        if (args.url && /^https?:\/\//.test(args.url)) {
           const url = args.url.replace(/\/+$/, "")
           const wellknown = await fetch(`${url}/.well-known/opencode`).then((x) => x.json() as any)
           prompts.log.info(`Running \`${wellknown.auth.command.join(" ")}\``)
@@ -302,6 +302,10 @@ export const ProvidersLoginCommand = cmd({
           prompts.log.success("Logged into " + url)
           prompts.outro("Done")
           return
+        }
+        // Treat a non-URL positional arg as a provider name
+        if (args.url && !args.provider) {
+          args.provider = args.url
         }
         await ModelsDev.refresh(true).catch(() => {})
 

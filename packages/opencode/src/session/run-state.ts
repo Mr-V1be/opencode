@@ -11,6 +11,7 @@ export namespace SessionRunState {
   export interface Interface {
     readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void>
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+    readonly waitForIdle: (sessionID: SessionID) => Effect.Effect<void>
     readonly ensureRunning: (
       sessionID: SessionID,
       onInterrupt: Effect.Effect<MessageV2.WithParts>,
@@ -56,12 +57,17 @@ export namespace SessionRunState {
         if (existing) return existing
         const next = Runner.make<MessageV2.WithParts>(data.scope, {
           onIdle: Effect.gen(function* () {
+            // onIdle: runner cleanup
             data.runners.delete(sessionID)
             yield* status.set(sessionID, { type: "idle" })
           }),
-          onBusy: status.set(sessionID, { type: "busy" }),
+          onBusy: Effect.gen(function* () {
+            // onBusy
+            yield* status.set(sessionID, { type: "busy" })
+          }),
           onInterrupt,
           busy: () => {
+            // BusyError
             throw new Session.BusyError(sessionID)
           },
         })
@@ -85,6 +91,21 @@ export namespace SessionRunState {
         yield* existing.cancel
       })
 
+      const waitForIdle = Effect.fn("SessionRunState.waitForIdle")(function* (sessionID: SessionID) {
+        const data = yield* InstanceState.get(state)
+        const existing = data.runners.get(sessionID)
+        if (!existing || !existing.busy) {
+          // waitForIdle: already idle
+          return
+        }
+        // waitForIdle: waiting for current run to finish
+        // Wait for the current run to complete by awaiting ensureRunning.
+        // When Running, ensureRunning returns the deferred of the current run.
+        // The dummy work is never started because the runner is already busy.
+        yield* existing.ensureRunning(Effect.void as any).pipe(Effect.exit, Effect.asVoid)
+        // waitForIdle: agent finished, proceeding
+      })
+
       const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
         sessionID: SessionID,
         onInterrupt: Effect.Effect<MessageV2.WithParts>,
@@ -101,7 +122,7 @@ export namespace SessionRunState {
         return yield* (yield* runner(sessionID, onInterrupt)).startShell(work)
       })
 
-      return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
+      return Service.of({ assertNotBusy, cancel, waitForIdle, ensureRunning, startShell })
     }),
   )
 

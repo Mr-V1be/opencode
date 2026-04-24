@@ -134,6 +134,17 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error)).toBeUndefined()
   })
 
+  test("retries structured OpenAI server_error messages", () => {
+    const error = new MessageV2.APIError({
+      message: "An error occurred while processing your request.",
+      isRetryable: true,
+      responseBody:
+        '{"type":"error","sequence_number":2,"error":{"type":"server_error","code":"server_error","message":"An error occurred while processing your request."}}',
+    }).toObject() as MessageV2.APIError
+
+    expect(SessionRetry.retryable(error)).toBe("An error occurred while processing your request.")
+  })
+
   test("does not throw on numeric error codes", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { code: 123 } }))
     const result = SessionRetry.retryable(error)
@@ -247,5 +258,42 @@ describe("session.message-v2.fromError", () => {
     })
     const result = MessageV2.fromError(error, { providerID: ProviderID.make("openai") }) as MessageV2.APIError
     expect(result.data.isRetryable).toBe(true)
+  })
+
+  test("marks OpenAI server_error API responses as retryable", () => {
+    const error = new APICallError({
+      message: "An error occurred while processing your request.",
+      url: "https://api.openai.com/v1/responses",
+      requestBodyValues: {},
+      statusCode: 400,
+      responseHeaders: { "content-type": "application/json" },
+      responseBody:
+        '{"type":"error","error":{"type":"server_error","code":"server_error","message":"An error occurred while processing your request."}}',
+      isRetryable: false,
+    })
+
+    const result = MessageV2.fromError(error, { providerID: ProviderID.make("openai") }) as MessageV2.APIError
+    expect(result.data.isRetryable).toBe(true)
+    expect(result.data.message).toContain("An error occurred while processing your request")
+  })
+
+  test("marks streamed OpenAI server_error events as retryable", () => {
+    const result = MessageV2.fromError(
+      {
+        type: "error",
+        sequence_number: 2,
+        error: {
+          type: "server_error",
+          code: "server_error",
+          message: "An error occurred while processing your request.",
+          param: null,
+        },
+      },
+      { providerID: ProviderID.make("openai") },
+    ) as MessageV2.APIError
+
+    expect(MessageV2.APIError.isInstance(result)).toBe(true)
+    expect(result.data.isRetryable).toBe(true)
+    expect(result.data.message).toBe("An error occurred while processing your request.")
   })
 })

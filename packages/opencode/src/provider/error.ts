@@ -30,6 +30,10 @@ export namespace ProviderError {
 
   function isOpenAiErrorRetryable(e: APICallError) {
     const status = e.statusCode
+    const body = json(e.responseBody)
+    const errorCode = typeof body?.error?.code === "string" ? body.error.code : ""
+    const errorType = typeof body?.error?.type === "string" ? body.error.type : ""
+    if (errorCode === "server_error" || errorType === "server_error") return true
     if (!status) return e.isRetryable
     // openai sometimes returns 404 for models that are actually available
     return status === 404 || e.isRetryable
@@ -112,7 +116,7 @@ export namespace ProviderError {
     | {
         type: "api_error"
         message: string
-        isRetryable: false
+        isRetryable: boolean
         responseBody: string
       }
 
@@ -128,6 +132,14 @@ export namespace ProviderError {
         return {
           type: "context_overflow",
           message: "Input exceeds context window of this model",
+          responseBody,
+        }
+      case "server_error":
+        return {
+          type: "api_error",
+          message:
+            typeof body?.error?.message === "string" ? body.error.message : "Provider server error. Retry the request.",
+          isRetryable: true,
           responseBody,
         }
       case "insufficient_quota":
@@ -151,6 +163,16 @@ export namespace ProviderError {
           isRetryable: false,
           responseBody,
         }
+    }
+
+    if (body?.error?.type === "server_error") {
+      return {
+        type: "api_error",
+        message:
+          typeof body?.error?.message === "string" ? body.error.message : "Provider server error. Retry the request.",
+        isRetryable: true,
+        responseBody,
+      }
     }
   }
 

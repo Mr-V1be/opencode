@@ -69,7 +69,9 @@ export namespace Runner {
         (st) =>
           [
             Effect.gen(function* () {
-              if (st._tag === "Running" && st.run.id === id) yield* idle
+              const goingIdle = st._tag === "Running" && st.run.id === id
+              // diagnostic removed — was corrupting TUI
+              if (goingIdle) yield* idle
               yield* complete(done, exit)
             }),
             st._tag === "Running" && st.run.id === id ? ({ _tag: "Idle" } as const) : st,
@@ -108,8 +110,10 @@ export namespace Runner {
           switch (st._tag) {
             case "Running":
             case "ShellThenRun":
+              // ensureRunning: state=Running/ShellThenRun — waiting on existing deferred
               return [Deferred.await(st.run.done), st] as const
             case "Shell": {
+              // ensureRunning: state=Shell — queuing as ShellThenRun
               const run = {
                 id: next(),
                 done: yield* Deferred.make<A, E | Cancelled>(),
@@ -120,6 +124,7 @@ export namespace Runner {
             case "Idle": {
               const done = yield* Deferred.make<A, E | Cancelled>()
               const run = yield* startRun(work, done)
+              // ensureRunning: state=Idle — starting new run
               return [Deferred.await(done), { _tag: "Running", run }] as const
             }
           }
