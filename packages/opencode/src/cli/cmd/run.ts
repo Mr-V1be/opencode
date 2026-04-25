@@ -677,7 +677,7 @@ export const RunCommand = cmd({
       return await execute(sdk)
     }
 
-    await bootstrap(process.cwd(), async () => {
+    await bootstrap(process.env.OPENCODE_CWD ?? process.cwd(), async () => {
       const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init)
         return Server.Default().app.fetch(request)

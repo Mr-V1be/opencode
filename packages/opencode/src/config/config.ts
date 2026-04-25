@@ -1075,6 +1075,12 @@ export namespace Config {
             .min(0)
             .optional()
             .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
+          strategy: z
+            .enum(["text", "remote"])
+            .optional()
+            .describe(
+              "Compaction strategy. 'text' (default): summarize history into plain text via the configured compaction model. 'remote': call Codex `/codex/responses/compact` (OpenAI/ChatGPT backend only) and store the returned encrypted state — preserves the model's latent understanding and uses far fewer tokens. Falls back to 'text' for non-OpenAI providers.",
+            ),
         })
         .optional(),
       experimental: z

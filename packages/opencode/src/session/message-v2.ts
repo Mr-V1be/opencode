@@ -208,6 +208,12 @@ export namespace MessageV2 {
     type: z.literal("compaction"),
     auto: z.boolean(),
     overflow: z.boolean().optional(),
+    // Remote compaction (Codex /codex/responses/compact) returns an opaque
+    // encrypted_content blob that preserves the model's latent state. When
+    // present, OpenAI/Codex SDK maps this part into a `compaction_summary`
+    // input item so the model can keep context with very few tokens.
+    // Other providers will see only the adjacent text summary as fallback.
+    encryptedContent: z.string().optional(),
   }).meta({
     ref: "CompactionPart",
   })

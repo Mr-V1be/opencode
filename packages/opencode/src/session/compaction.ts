@@ -19,6 +19,7 @@ import { Effect, Layer, ServiceMap } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow } from "./overflow"
+import { CompactionRemote } from "./compaction-remote"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -180,6 +181,134 @@ export namespace SessionCompaction {
         const model = agent.model
           ? yield* provider.getModel(agent.model.providerID, agent.model.modelID)
           : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID)
+
+        // Try Codex remote compaction first when configured.
+        // Falls through to the regular text-summary path on any failure.
+        const cfgForStrategy = yield* config.get()
+        const strategy = cfgForStrategy.compaction?.strategy ?? "text"
+        if (strategy === "remote" && model.providerID === "openai") {
+          const items: CompactionRemote.RemoteInputItem[] = []
+          for (const m of messages) {
+            const text = m.parts
+              .filter((p) => p.type === "text" && !(p as any).ignored)
+              .map((p) => (p as any).text as string)
+              .filter((t) => typeof t === "string" && t.trim())
+              .join("\n\n")
+            if (!text) continue
+            if (m.info.role === "user") {
+              items.push({ type: "message", role: "user", content: [{ type: "input_text", text }] })
+            } else if (m.info.role === "assistant") {
+              items.push({ type: "message", role: "assistant", content: [{ type: "output_text", text }] })
+            }
+          }
+          if (items.length > 0) {
+            const remote = yield* CompactionRemote.compact({
+              model: model.api.id,
+              instructions:
+                "You are compacting a coding-agent conversation. Preserve goals, decisions, files, and state.",
+              items,
+            })
+            if (remote) {
+              log.info("remote compaction ok", { usage: remote.usage })
+              const ctxRem = yield* InstanceState.context
+              const assistantMsg: MessageV2.Assistant = {
+                id: MessageID.ascending(),
+                role: "assistant",
+                parentID: input.parentID,
+                sessionID: input.sessionID,
+                mode: "compaction",
+                agent: "compaction",
+                variant: userMessage.model.variant,
+                summary: true,
+                path: { cwd: ctxRem.directory, root: ctxRem.worktree },
+                cost: 0,
+                tokens: {
+                  output: remote.usage.output_tokens ?? 0,
+                  input: remote.usage.input_tokens ?? 0,
+                  reasoning: 0,
+                  cache: { read: 0, write: 0 },
+                },
+                modelID: model.id,
+                providerID: model.providerID,
+                time: { created: Date.now(), completed: Date.now() },
+                finish: "stop",
+              }
+              yield* session.updateMessage(assistantMsg)
+              yield* session.updatePart({
+                id: PartID.ascending(),
+                messageID: assistantMsg.id,
+                sessionID: input.sessionID,
+                type: "text",
+                synthetic: true,
+                text:
+                  "[Remote compaction] Conversation state preserved as encrypted latent state. The model retains full context.",
+                time: { start: Date.now(), end: Date.now() },
+              })
+              yield* session.updatePart({
+                id: PartID.ascending(),
+                messageID: assistantMsg.id,
+                sessionID: input.sessionID,
+                type: "compaction",
+                auto: input.auto,
+                overflow: input.overflow,
+                encryptedContent: remote.encryptedContent,
+              })
+
+              if (input.auto) {
+                if (replay) {
+                  const original = replay.info
+                  const replayMsg = yield* session.updateMessage({
+                    id: MessageID.ascending(),
+                    role: "user",
+                    sessionID: input.sessionID,
+                    time: { created: Date.now() },
+                    agent: original.agent,
+                    model: original.model,
+                    format: original.format,
+                    tools: original.tools,
+                    system: original.system,
+                  })
+                  for (const part of replay.parts) {
+                    if (part.type === "compaction") continue
+                    const replayPart =
+                      part.type === "file" && MessageV2.isMedia(part.mime)
+                        ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
+                        : part
+                    yield* session.updatePart({
+                      ...replayPart,
+                      id: PartID.ascending(),
+                      messageID: replayMsg.id,
+                      sessionID: input.sessionID,
+                    })
+                  }
+                } else {
+                  const continueMsg = yield* session.updateMessage({
+                    id: MessageID.ascending(),
+                    role: "user",
+                    sessionID: input.sessionID,
+                    time: { created: Date.now() },
+                    agent: userMessage.agent,
+                    model: userMessage.model,
+                  })
+                  yield* session.updatePart({
+                    id: PartID.ascending(),
+                    messageID: continueMsg.id,
+                    sessionID: input.sessionID,
+                    type: "text",
+                    synthetic: true,
+                    text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+                    time: { start: Date.now(), end: Date.now() },
+                  })
+                }
+              }
+
+              yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+              return "continue" as const
+            }
+            log.warn("remote compaction failed — falling back to text strategy")
+          }
+        }
+
         // Allow plugins to inject context or replace compaction prompt.
         const compacting = yield* plugin.trigger(
           "experimental.session.compacting",

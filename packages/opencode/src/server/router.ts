@@ -30,7 +30,7 @@ export function WorkspaceRouterMiddleware(upgrade: UpgradeWebSocket): Middleware
   const routes = lazy(() => InstanceRoutes(upgrade))
 
   return async (c) => {
-    const raw = c.req.query("directory") || c.req.header("x-opencode-directory") || process.cwd()
+    const raw = c.req.query("directory") || c.req.header("x-opencode-directory") || process.env.OPENCODE_CWD || process.cwd()
     const directory = Filesystem.resolve(
       (() => {
         try {
