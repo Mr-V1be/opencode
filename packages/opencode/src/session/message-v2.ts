@@ -794,6 +794,16 @@ export namespace MessageV2 {
                 ...(differentModel ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
               })
           }
+          if (part.type === "compaction" && part.encryptedContent) {
+            // Carry the Codex remote-compaction encrypted state to the next
+            // turn via a text part that the @guard22/opencode-multi-auth-codex
+            // customFetch transforms into a real `compaction_summary` input
+            // item before the request hits ChatGPT backend.
+            assistantMessage.parts.push({
+              type: "text",
+              text: `__OC_COMPACTION_SUMMARY__:${part.encryptedContent}:__OC_END__`,
+            })
+          }
           if (part.type === "reasoning") {
             assistantMessage.parts.push({
               type: "reasoning",
